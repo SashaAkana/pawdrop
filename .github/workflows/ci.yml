@@ -1,0 +1,57 @@
+name: Check PawDrop
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r app/requirements.txt -r requirements-dev.txt
+      - run: python -m pytest -q
+  compose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure isolated smoke test
+        run: |
+          cp .env.example .env
+          password=$(openssl rand -hex 32)
+          echo "::add-mask::$password"
+          sed -i "s/^ADMIN_PASSWORD=.*/ADMIN_PASSWORD=$password/" .env
+      - run: docker compose config --quiet
+      - run: docker compose up -d --build --wait --wait-timeout 120
+      - name: Gateway smoke test
+        run: |
+          python - <<'PY'
+          import http.cookiejar, re, urllib.request, urllib.parse
+          from pathlib import Path
+          base = 'http://127.0.0.1:18076'
+          password = next(s.split('=',1)[1] for s in Path('.env').read_text().splitlines() if s.startswith('ADMIN_PASSWORD='))
+          client = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+          assert client.open(base+'/health').read() == b'ok\n'
+          page = client.open(base+'/admin/login', urllib.parse.urlencode({'password': password}).encode()).read().decode()
+          csrf = re.search(r'name="csrf" value="([^"]+)"', page)[1]
+          boundary = 'pawdrop-smoke-boundary'
+          key = 'ci_smoke_random_test_key_123456'
+          body = (f'--{boundary}\r\nContent-Disposition: form-data; name="csrf"\r\n\r\n{csrf}\r\n'
+                  f'--{boundary}\r\nContent-Disposition: form-data; name="uuid"\r\n\r\n{key}\r\n'
+                  f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="test.txt"\r\nContent-Type: text/plain\r\n\r\nhello\r\n--{boundary}--\r\n').encode()
+          client.open(urllib.request.Request(base+'/admin/upload', body, {'Content-Type': 'multipart/form-data; boundary='+boundary})).close()
+          assert urllib.request.urlopen(base+'/'+key).read() == b'hello'
+          client.open(base+'/admin/delete', urllib.parse.urlencode({'uuid':key,'csrf':csrf}).encode()).close()
+          try:
+              urllib.request.urlopen(base+'/'+key)
+          except urllib.error.HTTPError as exc:
+              assert exc.code == 404
+          else:
+              raise AssertionError('Deleted link still accessible')
+          PY
+      - if: always()
+        run: docker compose down -v
